@@ -1,4 +1,5 @@
-import { extname } from "path"
+import { MIMEType } from "util";
+import { extname } from "path";
 
 export const mimeTypes = Object.defineProperty({
 	'.html': 'text/html',
@@ -23,10 +24,12 @@ export const mimeTypes = Object.defineProperty({
 	'.eot': 'application/vnd.ms-fontobject',
 	'.otf': 'application/font-otf',
 	'.wasm': 'application/wasm',
-	'.xml': 'application/xml'
+	'.xml': 'application/xml',
+	'.zip': 'application/zip'
 }, 'parse', {
 	value: function parse(fileName) {
-		return this[extname(fileName).toLowerCase()] || 'text/plain'
+		const type = this[extname(fileName).toLowerCase()] || 'text/plain'
+		return new MIMEType(type)
 	}
 });
 export default mimeTypes;

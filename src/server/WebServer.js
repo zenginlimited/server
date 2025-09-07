@@ -1,49 +1,45 @@
-import EventEmitter from "events";
+import AbstractServer from "./AbstractServer.js";
 import { createReadStream, existsSync, readdirSync } from "fs";
-import { readdir, stat } from "fs/promises";
+import { readdir, realpath, stat } from "fs/promises";
 import { Server as Server } from "http";
 import { Server as SecureServer } from "https";
 import { isIP } from "net";
-import { basename, dirname, extname, matchesGlob } from "path";
-// import sharp from "sharp";
+import { basename, dirname, extname, matchesGlob, resolve, sep } from "path";
 import mimeTypes from "../utils/mimeTypes.js";
-import Pipeline from "./Pipeline.js";
+
+const JAIL_ROOT = process.cwd()
+	, testPath = p => p.slice(1) === JAIL_ROOT.slice(1) || p.slice(1).startsWith(JAIL_ROOT.slice(1) + sep);
+const safeJoinCap = (...args) => {
+	const safeArgs = args.map(a => a.replace(/^[/\\]+/, ''))
+		, resolved = resolve(JAIL_ROOT, ...safeArgs);
+	if (!testPath(resolved)) return JAIL_ROOT;
+	return resolved
+};
+const jailPath = async (...args) => {
+	const resolved = safeJoinCap(...args);
+	try {
+		const real = await realpath(resolved);
+		if (!testPath(real)) throw new RangeError('Path traversal detected');
+		return real;
+	} catch (err) { if (err.code !== 'ENOENT') throw err }
+	return resolved
+};
 
 const SOCIAL_BOTS = /(facebookexternalhit|Discordbot|Twitterbot|LinkedInBot|WhatsApp)/i
 	, OTHER_BOTS = /(Googlebot|bingbot|DuckDuckBot|Slurp|YandexBot)/i;
 
-export default class WebServer extends EventEmitter {
-	static Pipeline = Pipeline;
-
-	#protected = new Map();
-	#rateLimits = new Map();
+export default class WebServer extends AbstractServer {
+	#rateLimits = new Map;
 	#requests = {};
-	#routes = new Map();
 
-	/**
-	 * 
-	 * @param {object} [options]
-	 * @param {number} options.port
-	 * @param {string} [options.host]
-	 * @param {boolean} [options.redirectProtocol]
-	 * @param {function} [callback]
-	 */
-	constructor(options, callback) {
-		const isSecure = options.isSecure || String(options.port).endsWith(443);
-		if (!isSecure) {
-			if (options.redirectProtocol) {
-				new SecureServer(options, (req, res) => {
-					// console.log('REQUEST, SECURE', req.url)
-					const host = req.headers.host.replace(/:\d+$/, ''); // Remove port if any
-					res.writeHead(301, { Location: `http://${host}${req.url}` }).end()
-				}).listen(443, '::');
-			} else if (options.allowUnsecure) {
-				new SecureServer(options, (req, res) => this._server.emit('request', req, res)).listen(443, '::');
-			}
-		}
-
-		super();
-		Object.defineProperty(this, '_server', { value: new (isSecure ? SecureServer : Server)(options, async (req, res) => {
+	constructor(options) {
+		options = Object.assign({
+			keepAlive: true,
+			noDelay: true
+		}, options, options?.ssl);
+		delete options.ssl;
+		super(...arguments);
+		Object.defineProperty(this, '_server', { value: new (options.ssl ? SecureServer : Server)(options, async (req, res) => {
 			req.on('error', err => {
 				if (err.code === 'ECONNRESET') {
 					Object.defineProperty(req, 'aborted', { value: true, writable: false });
@@ -59,8 +55,17 @@ export default class WebServer extends EventEmitter {
 			);
 
 			await this.constructor.enhanceReq(req);
-			this.constructor.enhanceRes(res);
-			// this._preprocessReq();
+			this.constructor.enhanceRes(res, this.pipeline);
+
+			if (this._conditions.length > 0) {
+				const results = await Promise.all(this._conditions.map(c => c(req, res)));
+				if (!results.every(Boolean)) return;
+			}
+
+			for (const condition of this._conditions) {
+				if (!await condition(req, res)) return;
+			}
+
 			if (!req.isIPInternal() && this.#rateLimit(req)) {
 				res.setHeader('retry-after', (60 - Math.floor((Date.now() - this.#rateLimits.get(req.ip)) / 1e3)));
 				return res.reject(429, { message: "You're doing that too often! Try again in " + (60 - Math.floor((Date.now() - this.#rateLimits.get(req.ip)) / 1e3)) + " seconds." });
@@ -117,14 +122,14 @@ export default class WebServer extends EventEmitter {
 						req.on('end', () => {
 							const body = Buffer.concat(chunks)
 								, contentType = req.headers['content-type'];
-							if (contentType?.startsWith('application/octet-stream')) resolve(body);
-							else if (contentType?.startsWith('multipart/form-data')) {
-								try {
-									const boundary = /boundary=(.+)/.exec(contentType)?.[1];
+							if (contentType?.startsWith('application/octet-stream')) return resolve(body);
+							try {
+								if (contentType?.startsWith('multipart/form-data')) {
+									const boundary = /boundary=(.+)/.exec(contentType)?.[1] || body.toString('utf8').match(/(?<=^--)[^\n\r]+/)?.[0];
 									if (!boundary) throw new Error('Boundary not found');
 
-									const parts = parseMultipartFormData(body, boundary);
-									const multipartBody = Object.defineProperty({ files: [] }, 'parts', { value: parts, writable: true });
+									const parts = parseMultipartFormData(body, boundary)
+										, multipartBody = Object.defineProperty({ files: [] }, 'parts', { value: parts, writable: true });
 									for (const part of parts) {
 										if (part.fileName && multipartBody.files.push(part.file)) {
 											multipartBody[part.fieldName] = part.file; continue;
@@ -133,11 +138,11 @@ export default class WebServer extends EventEmitter {
 									}
 
 									resolve(multipartBody);
-								} catch (err) { reject(err) }
-							} else if (body.length > 0) {
-								try { resolve(JSON.parse(body.toString())) }
-								catch (err) { reject(err) }
-							} else resolve(null)
+								} else if (body.length > 0) {
+									resolve(JSON.parse(body.toString()));
+								}
+							} catch (err) { reject(err) }
+							resolve(null)
 						})
 					});
 				} catch(err) {
@@ -147,11 +152,11 @@ export default class WebServer extends EventEmitter {
 
 			req.isBot() && console.log('[CRAWLER DETECTED]', req.headers['user-agent']);
 
-			const isRouteProtected = this.#isProtected(req.url, { subdomain });
+			const isRouteProtected = this._isProtected(req.url, { subdomain });
 			if (isRouteProtected) {
 				let authorization = req.headers.authorization || (isRouteProtected.cookie && req.cookies.get(isRouteProtected.cookie))
 					, redirectPath = isRouteProtected.authRedirect;
-				if ((!authorization || !this.#authenticate(authorization, isRouteProtected)) && (!redirectPath || req.url !== redirectPath) && (!isRouteProtected.authEndpoint || !req.url.startsWith(isRouteProtected.authEndpoint))) {
+				if ((!authorization || !this._authenticate(authorization, isRouteProtected)) && (!redirectPath || req.url !== redirectPath) && (!isRouteProtected.authEndpoint || !req.url.startsWith(isRouteProtected.authEndpoint))) {
 					if (redirectPath) {
 						// let returnPath = '';
 						// req.url !== '/' && (returnPath += '?return=' + encodeURI(req.url));
@@ -162,12 +167,15 @@ export default class WebServer extends EventEmitter {
 				}
 			}
 
-			if (req.params.has('download')) {
-				return res.downloadFile(`${subdomain ? (options.host ? subdomain + '.' + options.host : req.headers.host) : 'public'}${req.url.replace(/\/$/, '')}${/\.\w*$/.test(req.url) ? '' : '/index.html'}`);
-			}
+			Object.defineProperty(req, 'filePath', { value: await jailPath(subdomain ? (options.host ? subdomain + '.' + options.host : req.headers.host) : this.root, req.url, extname(req.url) ? '' : 'index.html'), writable: true });
+			if (req.params.has('download')) return res.downloadFile(req.filePath);
+			Object.defineProperties(req, {
+				actualPath: { value: req.filePath, writable: true },
+				dirPath: { value: req.filePath.replace(basename(req.filePath), ''), writable: true }
+			});
 
 			const saveData = 'on' === req.headers['save-data'];
-			let route = this.#route(req.method, (subdomain !== null ? `${subdomain}.` : '') + req.url);
+			let route = this._route(req.method, (subdomain !== null ? `${subdomain}.` : '') + req.url);
 			if (typeof route == 'function') {
 				// add :id wildcard options
 				if (route.isDynamic) {
@@ -203,7 +211,7 @@ export default class WebServer extends EventEmitter {
 				// res.setTimeout(10e3, () => !res.deferred && !res.finished && res.writeHead(408).end());
 				Object.defineProperty(res, '_timeout', {
 					configurable: true,
-					value: setTimeout(() => !res.finished && res.writeHead(408).end(), 10e3)
+					value: setTimeout(() => !res.finished && !res.headersSent && res.writeHead(408).end(), 10e3)
 				});
 				try {
 					let result = route(req, res);
@@ -215,56 +223,8 @@ export default class WebServer extends EventEmitter {
 				}
 			}
 
-			res.sendDefault(options);
-		}), writable: true });
-		Object.defineProperty(this, 'listen', { value: this._server.listen.bind(this._server), writable: true });
-		if (typeof (callback ||= arguments[arguments.length - 1]) == 'function') this.on('listening', callback);
-		if (options && typeof options != 'function') {
-			if (typeof options != 'object') throw new TypeError("Options must be of type: Object");
-			Object.defineProperty(this, 'options', { value: options });
-			// this.listen(options.port ?? 80, options.host ?? null)
-		}
-	}
-
-	#authenticate(authorization, config) {
-		let match = /\S+$/.exec(authorization)?.[0];
-		return config.authCallback && config.authCallback(match)
-	}
-
-	#isProtected(path, { subdomain } = {}) {
-		subdomain && (path = subdomain + '.' + path);
-		let wildCards = Array.from(this.#protected.keys()).filter(path => path.endsWith('*'));
-		for (let protectedPath of wildCards) {
-			// console.log(path.matchesGlob(path, wildCards));
-			let regex = new RegExp(protectedPath.replace(/\./g, '\\.').replace('*', '.*'));
-			if (regex.test(path)) {
-				path = protectedPath;
-				break;
-			}
-		}
-
-		return this.#protected.has(path) && this.#protected.get(path)
-	}
-
-	#matchesGlob(path, glob) {
-		if (glob.includes('?'))
-			glob = glob.replace(/\?$/g, '.');
-
-		if (glob.includes('*')) {
-			glob = glob.replace(/(?<!\*)(\*)(?!\*)/g, '[^/]$1');
-			if (glob.includes('**'))
-				glob = glob.replace(/(\*){2}/g, '.$1');
-		}
-
-		if (glob.includes('[!'))
-			glob = glob.replace(/(?<=\[)(\!)(?=.+\])/g, '^');
-
-		// match :id wildcard options
-		if (glob.includes('/:'))
-			glob = glob.replace(/:[^\/]+/g, '[^/]+');
-
-		const globRegex = new RegExp('^' + glob + '$');
-		return globRegex.test(path)
+			res.continue()
+		}), writable: true })
 	}
 
 	#rateLimit(req) {
@@ -288,136 +248,6 @@ export default class WebServer extends EventEmitter {
 		}
 
 		return this.#rateLimits.has(req.ip)
-	}
-
-	#route(method, path) {
-		const route = this.#routes.get(method) || new Map();
-		if (!path) return route;
-		let match = route.get(path);
-		if (!match) {
-			// match :id wildcard options
-			const globs = Array.from(route.keys()).filter(r => r.includes('*') || /:\w+/.test(r)).sort((a, b) => b.length - a.length) // Array.from(route.keys()).filter(rout => rout.includes('*')).sort((a, b) => b.length - a.length)
-				, glob = globs.find(glob => this.#matchesGlob(path, glob) /* Match everything, and I mean everything */ /* matchesGlob(path, rout) */);
-			if (glob) {
-				const globMatch = route.get(glob)
-					, matchesException = globMatch.exceptions && globMatch.exceptions.find(glob => this.#matchesGlob(path, glob));
-				if (!matchesException) {
-					match = route.get(glob);
-				}
-			}
-		}
-
-		return match || route.get("*")
-	}
-
-	#saveRoute(method, path, callback, exceptions) {
-		if (typeof path != "string") {
-			if (!Array.isArray(path)) throw new TypeError("Path must be of type: string");
-			for (const p of path) this.#saveRoute(method, p, callback, exceptions);
-			return;
-		}
-		if (typeof callback != "function") throw new TypeError("Callback must be of type: function");
-		if (!this.#routes.has(method))
-			this.#routes.set(method, new Map());
-
-		if (typeof exceptions == 'object' && exceptions !== null) {
-			Object.defineProperty(callback, 'exceptions', {
-				value: Object.values(exceptions),
-				writable: true
-			});
-		}
-
-		Object.defineProperty(callback, 'glob', { value: path, writable: true });
-		Object.defineProperty(callback, 'isDynamic', { value: /\/:.+/.test(path), writable: true });
-		this.#route(method).set(path, callback)
-	}
-
-	/**
-	 * 
-	 * @param {string} path
-	 * @param {function} callback
-	 */
-	auth(path, callback) {
-		if (typeof path != "string") throw new TypeError("Path must be of type: string");
-		if (typeof callback != "function") throw new TypeError("Callback must be of type: function");
-		this.#protected.set(path, Object.assign({ authCallback: callback }, this.#protected.get(path)))
-	}
-
-	/**
-	 * 
-	 * @param {string} path
-	 * @param {function} callback
-	 */
-	delete(path, callback) {
-		return this.#saveRoute('DELETE', ...arguments)
-	}
-
-	/**
-	 * 
-	 * @param {string} path
-	 * @param {function} callback
-	 */
-	get(path, callback) {
-		return this.#saveRoute('GET', ...arguments)
-	}
-
-	/**
-	 * 
-	 * @param {string} path
-	 * @param {function} callback
-	 */
-	head(path, callback) {
-		return this.#saveRoute('HEAD', ...arguments)
-	}
-
-	/**
-	 * 
-	 * @param {string} path
-	 * @param {function} callback
-	 */
-	patch(path, callback) {
-		return this.#saveRoute('PATCH', ...arguments)
-	}
-
-	/**
-	 * 
-	 * @param {string} path
-	 * @param {function} callback
-	 */
-	post(path, callback) {
-		return this.#saveRoute('POST', ...arguments)
-	}
-
-	/**
-	 * Protect a file or directory
-	 * @param {(string|Iterable)} path
-	 * @param {object} [config]
-	 * @param {function} config.authCallback
-	 * @param {string} [config.authEndpoint]
-	 * @param {string} [config.authRedirect]
-	 * @param {string} [config.cookie]
-	 * @param {string} callback
-	 */
-	protect(path, config, callback) {
-		if (typeof path != 'string') {
-			if (!Array.isArray(path)) throw new TypeError("Path must be of type: string");
-			const args = Array.prototype.slice.call(arguments, 1);
-			for (const p of path) this.protect(p, ...args);
-			return;
-		}
-
-		if (typeof config == 'function') config = { authCallback: config };
-		else if (typeof callback == 'function') Object.assign(config, { authCallback: callback });
-		this.#protected.set(path, Object.assign({}, this.#protected.get(path), config))
-	}
-
-	/**
-	 * 
-	 * @param {string} path 
-	 * @param {function} callback 
-	 */
-	put(path, callback) {
-		return this.#saveRoute('PUT', ...arguments)
 	}
 
 	static enhanceReq(req) {
@@ -451,9 +281,24 @@ export default class WebServer extends EventEmitter {
 		})
 	}
 
-	static enhanceRes(res, server) {
+	static enhanceRes(res, pipeline = null) {
 		return Object.defineProperties(res, {
-			_server: { value: server },
+			continue: {value: function respond(options = {}) {
+				const { headers, method, url } = this.req;
+				switch (method) {
+				case 'GET': {
+					const domainFolder = headers.subdomain ? headers.subdomain + '.' + (options.host || headers.host) : 'public';
+					try { this.sendFile(`${domainFolder}${url.replace(/\/$/, '')}${/\.\w*$/.test(url) ? '' : '/index.html'}`) }
+					catch(err) {
+						console.warn('Failed to handle GET', err);
+						!this.finished && this.reject(500, 'Internal Server Error')
+					}
+				} break;
+				case 'HEAD':
+				case 'OPTIONS': this.writeHead(200).end(); break;
+				default: this.writeHead(404).end()
+				}
+			}},
 			// cookie: {value: function cookie(name, domain) {
 			// 	this.setHeader('Set-Cookie', )
 			// }},
@@ -472,7 +317,7 @@ export default class WebServer extends EventEmitter {
 				this.sendFile(path)
 			}, writable: true},
 			// redirect: {value: function redirect(url) {
-			// 	this.writeHead(307, { Location: url })
+			// 	this.writeHead(307, { Location: url }).end()
 			// }},
 			reject: {value: function reject() {
 				const { data, status } = parseStatus(...arguments);
@@ -485,27 +330,23 @@ export default class WebServer extends EventEmitter {
 				this.sendStatus(status, data)
 			}},
 			send: {value: function send(data) { this.resolve(200, data) }},
-			sendDefault: {value: function sendDefault(options = {}) {
-				const { headers, method, url } = this.req;
-				switch (method) {
-				case 'GET': {
-					const domainFolder = headers.subdomain ? headers.subdomain + '.' + (options.host || headers.host) : 'public';
-					try { this.sendFile(`${domainFolder}${url.replace(/\/$/, '')}${/\.\w*$/.test(url) ? '' : '/index.html'}`) }
-					catch(err) {
-						console.warn('Failed to handle GET', err);
-						!this.finished && this.reject(500, 'Internal Server Error')
-					}
-				} break;
-				case 'HEAD':
-				case 'OPTIONS': this.writeHead(200).end(); break;
-				default: this.writeHead(404).end()
-				}
-			}},
-			sendFile: {value: function sendFile(path) {
+			sendFile: {value: async function sendFile(path) {
 				if (domainify.test(path)) path = domainify.call(this.req, path);
 				let contentType = /* mimeTypes.parse(path); // */ mimeTypes[extname(path).toLowerCase()];
 				if (!contentType) return this.reject(415, `Sorry, file extension ${extname(path)} is not currently supported.`);
-				if (contentType.startsWith('image')) return this.sendImage(path);
+				if (contentType.startsWith('image') && !existsSync(path)) {
+					path = path.replace(extname(path), '');
+					const dir = dirname(path);
+					if (existsSync(dir)) {
+						const files = await readdir(dir).then(files =>
+							files.filter(basename =>
+								mimeTypes[extname(basename)]?.startsWith('image/')
+							)
+						);
+						path = dir + '/' + files.find(file => basename(file, extname(file)) === basename(path));
+						this.req.actualPath = path;
+					}
+				}
 
 				// let referer = URL.canParse(this.req.headers.referer) && new URL(this.req.headers.referer);
 				// let relativePath = (this.req.headers.subdomain ? this.req.headers.host : 'public') + (referer && (await stat((this.req.headers.subdomain ? this.req.headers.host : 'public') + referer.pathname).isDirectory() ? referer.pathname.replace(/\/?$/, '/') : dirname(referer.pathname))) + this.req.url.replace(/^\//, '');
@@ -524,10 +365,12 @@ export default class WebServer extends EventEmitter {
 				this.statusCode = 200;
 				this.setHeader('Content-Type', contentType);
 
-				// const fileStream = createReadStream(path)
-				// 	, transformStream = Pipeline._stream(this.req, this, contentType);
-				// fileStream.pipe(transformStream).pipe(this);
-				const fileStream = createReadStream(path);
+				let fileStream = createReadStream(path);
+				if (pipeline) {
+					const transformStream = pipeline._stream(this.req, this, contentType);
+					fileStream = fileStream.pipe(transformStream);
+				}
+
 				fileStream.pipe(this);
 				fileStream.on('error', err => {
 					console.error(err);
@@ -540,51 +383,6 @@ export default class WebServer extends EventEmitter {
 				});
 
 				this.on('close', () => fileStream.destroy())
-			}, writable: true},
-			sendImage: {value: async function sendImage(path) {
-				const ext = extname(path)
-					, contentType = mimeTypes[ext];
-				if (!existsSync(path)) {
-					path = path.replace(ext, '');
-					const dir = dirname(path);
-					if (existsSync(dir)) {
-						const files = await readdir(dir).then(files =>
-							files.filter(basename =>
-								mimeTypes[extname(basename)]?.startsWith('image/')
-							)
-						);
-						path = dir + '/' + files.find(file => basename(file, extname(file)) === basename(path));
-					}
-				}
-
-				if (!existsSync(path)) return this.reject(404, 'Error: File Not Found');
-				this.statusCode = 200;
-				this.setHeader('Content-Type', contentType);
-
-				let stream = createReadStream(path);
-				// if (!['.ico', '.svg'].includes(ext)) {
-				// 	const imageOptimizationStream = sharp({ failOn: 'none' });
-				// 	if (this.req.searchParams?.has('size')) {
-				// 		const targetSize = parseInt(this.req.searchParams.get('size'));
-				// 		isFinite(targetSize) && imageOptimizationStream.resize(targetSize);
-				// 	}
-
-				// 	let targetExt = extname(this.req.url);
-				// 	if (targetExt !== extname(path) && typeof imageOptimizationStream[targetExt = targetExt.slice(1)] == 'function') imageOptimizationStream[targetExt]({ force: true, nearLossless: true });
-				// 	stream = stream.pipe(imageOptimizationStream);
-				// }
-
-				stream.pipe(this);
-				stream.on('error', err => {
-					console.error(err);
-					if (!this.headersSent) {
-						this.statusCode = 500;
-						this.end('Error reading the file');
-					} else {
-						this.destroy(err)
-					}
-				});
-				this.on('close', () => stream.destroy())
 			}, writable: true},
 			sendStatus: {value: function sendStatus(status, data) {
 				let contentType = "text/plain";
@@ -671,9 +469,9 @@ const parseStatus = (status, data) => {
 };
 
 function parseMultipartFormData(rawData, boundary) {
-	const parts = [];
-	const boundaryBytes = Buffer.from(`--${boundary}`);
-	const endBoundaryBytes = Buffer.from(`--${boundary}--`);
+	const parts = []
+		, boundaryBytes = Buffer.from(`--${boundary}`)
+		, endBoundaryBytes = Buffer.from(`--${boundary}--`);
 
 	let startIndex = rawData.indexOf(boundaryBytes) + boundaryBytes.length;
 	let endIndex = rawData.indexOf(boundaryBytes, startIndex);

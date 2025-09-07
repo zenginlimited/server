@@ -1,10 +1,26 @@
-import { Transform } from 'stream';
+import { PassThrough, Transform } from 'stream';
 
 export default class Pipeline {
 	#hasGeneratorPipes = false;
 	#hasAsyncGeneratorPipes = false;
 	#pipes = [];
+	#streams = [];
+	#streamFactories = [];
 	#typedPipeline = new Map();
+	get length() {
+		return (
+			this.#pipes.length +
+			Array.from(this.#typedPipeline.values()).flat().length +
+			this.#streams.length +
+			this.#streamFactories.length
+		)
+	}
+
+	#getApplicablePipes(contentType) {
+		const typed = this.#typedPipeline.get(contentType);
+		return [...this.#pipes, ...(typed || [])]
+	}
+
 	async #runPipe(pipe, chunk, ...args) {
 		switch (pipe.constructor.name) {
 			case 'AsyncGeneratorFunction': for await (const c of pipe(chunk, ...args)) chunk = c ?? chunk; break;
@@ -34,17 +50,33 @@ export default class Pipeline {
 	}
 
 	_stream(req, res, contentTypeOverride) {
-		const contentType = contentTypeOverride || res?.getHeader('Content-Type') || '';
-		return new Transform({
-			transform: async (chunk, encoding, callback) => {
-				try {
-					const result = await this.#runPipes(chunk.toString('utf8'), req, res, contentType);
-					callback(null, result);
-				} catch (err) {
-					callback(err);
+		const streams = []
+			, pipes = this.#getApplicablePipes(contentTypeOverride || res?.getHeader('Content-Type') || '');
+		if (pipes.length > 0) {
+			streams.push(new Transform({
+				transform: async (chunk, encoding, callback) => {
+					try {
+						let data = chunk.toString('utf8');
+						for (const pipe of pipes) {
+							data = await this.#runPipe(pipe, data, req, res);
+						}
+						callback(null, data);
+					} catch (err) {
+						callback(err)
+					}
 				}
-			}
-		})
+			}));
+		}
+
+		if (streams.push(
+			...this.#streams,
+			...this.#streamFactories.map(f => f(req, res)).filter(s => s && typeof s.pipe === 'function')
+		) === 0) return new PassThrough;
+
+		const head = streams[0];
+		let current = head;
+		for (let i = 1; i < streams.length; i++) current = current.pipe(streams[i]);
+		return head
 	}
 
 	addPipe(pipe, accept) {
@@ -81,6 +113,12 @@ export default class Pipeline {
 	}
 
 	addStream(stream) {
-		throw new Error('Not implemented')
+		if (!(stream instanceof Transform)) throw new TypeError('stream must be an instance of: Transform')
+		this.#streams.push(stream)
+	}
+
+	addStreamFactory(factory) {
+		if (typeof factory !== 'function') throw new TypeError('Stream factory must be (req, res) => Transform');
+		this.#streamFactories.push(factory)
 	}
 }
