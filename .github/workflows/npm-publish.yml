@@ -12,12 +12,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
       - run: npm install
       - run: npm test
 
   publish:
-    if: github.event_name == 'release' && github.event.action == 'published'
+    if: github.event_name == 'release' && github.event.action == 'published' && github.event.release.draft == false && github.event.release.prerelease == false
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -28,7 +27,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
       - run: npm install
       - run: npm publish --registry=https://npm.pkg.github.com/
         env:
@@ -38,7 +36,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{secrets.NPM_TOKEN}}
 
   publish-dev:
-    if: github.event_name == 'release' && github.event.action == 'prereleased'
+    if: github.event_name == 'release' && github.event.action == 'prereleased' && github.event.release.draft == false && github.event.release.prerelease == true
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -49,7 +47,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
       - run: npm install
       - run: npm publish --tag=dev --registry=https://npm.pkg.github.com/
         env:
