@@ -45,13 +45,13 @@ export default class Pipeline {
 	}
 
 	_process(data, req, res, contentTypeOverride) {
-		const contentType = contentTypeOverride || res.getHeader('Content-Type') || '';
+		const contentType = contentTypeOverride || res.getHeader?.('Content-Type') || res.headers.get('content-type') || '';
 		return this.#runPipes(data, req, res, contentType)
 	}
 
 	_stream(req, res, contentTypeOverride) {
 		const streams = []
-			, pipes = this.#getApplicablePipes(contentTypeOverride || res?.getHeader('Content-Type') || '');
+			, pipes = this.#getApplicablePipes(contentTypeOverride || res?.getHeader?.('Content-Type') || res?.headers.get('content-type') || '');
 		if (pipes.length > 0) {
 			streams.push(new Transform({
 				transform: async (chunk, encoding, callback) => {

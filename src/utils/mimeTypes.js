@@ -5,6 +5,7 @@ export const mimeTypes = Object.defineProperty({
 	'.html': 'text/html',
 	'.js': 'text/javascript',
 	'.css': 'text/css',
+	'.csv': 'text/csv',
 	'.txt': 'text/plain',
 	'.json': 'application/json',
 	'.png': 'image/png',

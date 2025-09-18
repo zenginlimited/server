@@ -25,15 +25,18 @@ export default class IncomingMessage extends EventEmitter {
 	// body = null;
 	cookies = new Map();
 	headers = null;
-	method = 'GET';
 	ip = null;
-	params = new URLSearchParams;
+	method = 'GET';
+	origin = null;
+	params = null;
 	path = null;
+	query = new URLSearchParams;
 	scheme = null;
 	constructor(server, stream, headers) {
 		super();
 		Object.defineProperties(this, {
 			aborted: { value: false, writable: true },
+			isSameOrigin: { value: false, writable: true },
 			server: { value: server },
 			stream: { value: stream }
 		});
@@ -51,12 +54,20 @@ export default class IncomingMessage extends EventEmitter {
 		Object.defineProperty(this, 'ipv4', { value: parseIPv4(this.ip) });
 		this.method = headers[':method'];
 
+		let origin = headers.origin || headers.referer;
+		if (origin && URL.canParse(origin)) {
+			origin = new URL(origin);
+			this.isSameOrigin = this.authority === origin.host;
+			this.origin = origin.origin;
+		}
+
 		let search = null;
 		this.path = headers[':path'].replace(/\?.*/, match => {
 			search = match;
 			return ''
 		});
-		this.params = new URLSearchParams(search);
+		this.query = new URLSearchParams(search);
+		this.scheme = headers[':scheme'];
 
 		// try { this.path = decodeURIComponent(this.path) }
 		// catch (error) { return this.emit('error', new Error("Malformed URI: " + this.path) }

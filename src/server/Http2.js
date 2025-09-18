@@ -1,9 +1,10 @@
-import AbstractServer from "./AbstractServer.js";
+import { randomUUID } from "crypto";
 import { readdirSync } from "fs";
 import { realpath } from "fs/promises";
 import { createSecureServer } from "http2";
 import { isIP } from "net";
 import { basename, extname, matchesGlob, resolve, sep } from "path";
+import AbstractServer from "./AbstractServer.js";
 import IncomingMessage from "../utils/IncomingMessage.js";
 import ServerResponse from "../utils/ServerResponse.js";
 
@@ -34,6 +35,14 @@ export default class WebServer extends AbstractServer {
 			// allowHTTP1: true
 		}, options, options?.ssl);
 		delete options.ssl;
+		if (options.cors) {
+			const allowHeaders = new Set([/* 'Content-Type' */]);
+			if (options.cors.allowCredentials) allowHeaders.add('Authorization');
+			if (Array.isArray(options.cors.allowHeaders)) for (const header of options.cors.allowHeaders) allowHeaders.add(header);
+			options.cors.allowHeaders = Array.from(allowHeaders).join(', ');
+			if (Array.isArray(options.cors.allowMethods)) options.cors.allowMethods = Array.from(options.cors.allowMethods).join(', ');
+		}
+
 		super(...arguments);
 		Object.defineProperty(this, '_server', { value: createSecureServer(options), writable: true });
 		this._server.on('stream', async (stream, headers) => {
@@ -57,27 +66,32 @@ export default class WebServer extends AbstractServer {
 				return res.reject(429, { message: "You're doing that too often! Try again in " + (60 - Math.floor((Date.now() - this.#rateLimits.get(req.ip)) / 1e3)) + " seconds." });
 			}
 
-			// console.log(req)
 			try { req.path = decodeURIComponent(req.path) }
 			catch (error) {
 				console.error(`Failed to decode "${req.path}":`, error);
 				return res.reject(400, { message: "Malformed URI: " + req.path });
 			}
 
-			// const referer = URL.canParse(req.headers.referer) ? new URL(req.headers.referer) : null
-			// 	, refererHost = referer ? referer.host : null;
-			// options.debug && console.log(req.path, 'Converted to relative path:', resolveRelativePath(req.path, req.headers.referer));
-			// options.debug && console.log(refererHost, req.authority)
-			if (/* (!referer || refererHost !== req.authority) && */ options.allowCORS) {
-				req.headers.origin && res.headers.set('Access-Control-Allow-Credentials', true);
-				res.headers.set('Access-Control-Allow-Methods', 'DELETE, GET, PATCH, POST, PUT');
-				res.headers.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Range');
-				// res.headers.set('Access-Control-Allow-Origin', req.headers.origin || '*');
-				res.headers.set('Access-Control-Allow-Origin', '*');
-				res.headers.set('Access-Control-Max-Age', 2592e3); // 30 days
+			if (!req.isSameOrigin) {
+				if (options.cors) {
+					options.cors.allowCredentials && req.origin && res.headers.set('Access-Control-Allow-Credentials', true);
+					options.cors.allowHeaders && res.headers.set('Access-Control-Allow-Headers', options.cors.allowHeaders);
+					options.cors.allowMethods && res.headers.set('Access-Control-Allow-Methods', options.cors.allowMethods || 'GET');
+					res.headers.set('Access-Control-Allow-Origin', req.origin || '*');
+					res.headers.set('Access-Control-Max-Age', options.cors.maxAge ?? 2592e3); // 30 days
+				}
+
+				if (options.blockCrossFrames) {
+					res.headers.set('Content-Security-Policy', "frame-ancestors 'self'");
+					res.headers.set('X-Frame-Options', 'SAMEORIGIN');
+				}
 			}
 
 			if (req.method === 'OPTIONS') return res.writeHead(204).end();
+
+			// const referer = URL.canParse(req.headers.referer) ? new URL(req.headers.referer) : null
+			// 	, refererHost = referer ? referer.host : null;
+			// options.debug && console.log(req.path, 'Converted to relative path:', resolveRelativePath(req.path, req.headers.referer));
 
 			Object.defineProperty(req.headers, 'subdomains', { value: [], writable: true });
 			let subdomain = null;
@@ -93,7 +107,16 @@ export default class WebServer extends AbstractServer {
 			options.forwardWWW && subdomain === 'www' && (subdomain = null);
 			req.headers.subdomain = subdomain;
 			req.headers.domain = req.authority?.replace(subdomain + '.', '');
-			if (req.method !== 'GET' && req.method !== 'HEAD') {
+			if (req.method === 'GET') {
+				if (!req.isBot() && options.sessionTracking && !req.cookies.has('zl_session')) {
+					res.cookie('zl_session', randomUUID(), {
+						domain: `.${req.headers.domain}`,
+						httpOnly: true,
+						sameSite: 'Lax',
+						secure: true
+					});
+				}
+			} else if (req.method !== 'HEAD') {
 				try {
 					req.body = await new Promise((resolve, reject) => {
 						const chunks = [];
@@ -156,52 +179,43 @@ export default class WebServer extends AbstractServer {
 			}
 
 			Object.defineProperty(req, 'filePath', { value: await jailPath(subdomain ? (options.hostname ? subdomain + '.' + options.hostname : req.authority) : this.root, req.path, extname(req.path) ? '' : 'index.html'), writable: true });
-			if (req.params.has('download')) return res.downloadFile(req.filePath);
+			if (req.query.has('download')) return res.downloadFile(req.filePath);
 			Object.defineProperties(req, {
 				actualPath: { value: req.filePath, writable: true },
 				dirPath: { value: req.filePath.replace(basename(req.filePath), ''), writable: true }
 			});
 
-			const saveData = 'on' === req.headers['save-data'];
-			let route = this._route(req.method, (subdomain !== null ? `${subdomain}.` : '') + req.path);
+			const pre = this._route('PRE', (subdomain !== null ? `${subdomain}.` : '') + req.path);
+			if (typeof pre == 'function') {
+				try {
+					let result = pre(req, res);
+					if (result instanceof Promise) result = await result;
+					if (res.finished) return;
+				} catch (err) {
+					res.finished || res.reject(500, 'Internal Server Error');
+					if (this.listenerCount('error') === 0) throw err;
+					return this.emit('error', err);
+				}
+			}
+
+			// const saveData = 'on' === req.headers['save-data'];
+			const route = this._route(req.method, (subdomain !== null ? `${subdomain}.` : '') + req.path);
 			if (typeof route == 'function') {
-				// add :id wildcard options
-				if (route.isDynamic) {
-					Object.defineProperty(req, 'routeMap', {
-						value: new Map(),
-						writable: true
-					});
-
-					try {
-						let identifiers = []
-						, regex = route.glob;
-						if (regex.includes('.')) {
-							regex = regex.replace('.', '\\.');
-						}
-
-						regex = regex.replace(/:([^\/]+)/g, (_, identifier) => {
-							identifiers.push(identifier);
-							return '([^/]+)'
-						});
-						regex = new RegExp('^' + regex + '$');
-						const [_, ...values] = regex.exec((subdomain !== null ? `${subdomain}.` : '') + req.path);
-						if (values && values.length > 0) {
-							for (const value in values) {
-								req.routeMap.set(identifiers[value], values[value]);
-							}
-						}
-					} catch (err) {
-						console.error('Failed to set identifiers:', err);
-					}
+				if (route.params) {
+					Object.defineProperty(req, 'params', { value: {}, writable: false });
+					const [_, ...params] = route.regex.exec((subdomain !== null ? `${subdomain}.` : '') + req.path);
+					if (params) for (const p in params) req.params[route.params[p]] = params[p];
 				}
 
 				try {
 					let result = route(req, res);
 					if (result instanceof Promise) result = await result;
 					if (result !== false || res.finished) return;
+					if (/* options.resolveReturnValue && */ result) res.resolve(result);
 				} catch (err) {
-					console.error('Unhandled error in request processing:', err);
-					return !res.finished && res.reject(500, 'Internal Server Error');
+					res.finished || res.reject(500, 'Internal Server Error');
+					if (this.listenerCount('error') === 0) throw err;
+					return this.emit('error', err);
 				}
 			}
 
@@ -272,7 +286,7 @@ function pathify(path, { temporary } = {}) {
 		let returnPath = '';
 		const isSameDomain = !path.startsWith('//');
 		if (!isSameDomain) {
-			returnPath += encodeURI('http://' + this.authority + this.path.replace(/\/$/, ''));
+			returnPath += encodeURI(`${this.scheme || this.headers[':scheme']}://${this.authority}${this.path.replace(/\/$/, '')}`);
 		} else if (this.path !== '/') {
 			returnPath += encodeURI(this.path);
 		}

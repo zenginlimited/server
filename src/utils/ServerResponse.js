@@ -2,7 +2,6 @@ import EventEmitter from "events";
 import { createReadStream, existsSync } from "fs";
 import { readdir, stat } from "fs/promises";
 import { basename, dirname, extname } from "path";
-import mimeTypes from "./mimeTypes.js";
 
 const parseStatus = (status, data) => {
 	const defaultStatus = 501;
@@ -15,6 +14,8 @@ const parseStatus = (status, data) => {
 	return { data, status }
 };
 
+// Convert to Transform -- when piping through res, pipe through Pipeline
+// Optional, devs can pipe raw content through stream to avoid Pipeline
 export default class ServerResponse extends EventEmitter {
 	#timeout = null;
 
@@ -29,7 +30,7 @@ export default class ServerResponse extends EventEmitter {
 			server: { value: server },
 			stream: { value: req.stream }
 		});
-		req.stream.once('end', () => {
+		req.stream.once('close', () => {
 			clearTimeout(this.#timeout);
 			this.#timeout = null;
 			this.emit('end')
@@ -41,11 +42,7 @@ export default class ServerResponse extends EventEmitter {
 		switch (this.req.method) {
 		case 'GET': {
 			const domainFolder = this.req.headers.subdomain ? this.req.headers.subdomain + '.' + (this.server.options.hostname || this.req.authority) : 'public';
-			try { this.sendFile(`${domainFolder}${this.req.path.replace(/\/$/, '')}${/\.\w*$/.test(this.req.path) ? '' : '/index.html'}`) }
-			catch(err) {
-				console.warn('Failed to handle GET', err);
-				!this.finished && this.reject(500, 'Internal Server Error')
-			}
+			this.sendFile(`${domainFolder}${this.req.path.replace(/\/$/, '')}${/\.\w*$/.test(this.req.path) ? '' : '/index.html'}`);
 		} break;
 		case 'HEAD':
 		case 'OPTIONS': this.writeHead(200).end(); break;
@@ -53,11 +50,25 @@ export default class ServerResponse extends EventEmitter {
 		}
 	}
 
-	// cookie(key, value, options) {
-	// 	this.headers.set('set-cookie', `${key}=${value};${options}`)
-	// }
+	cookie(key, value, options = {}) {
+		const attrs = Object.entries(options).map(([k, v]) =>
+			k.replace(/^\w/, c => c.toUpperCase()) + (v === true ? '' : `=${v}`)
+		).join('; ');
+		this.headers.append('Set-Cookie', `${key}=${value}${attrs ? '; ' + attrs : ''}`);
+		return this
+	}
 
-	// cors() {}
+	/**
+	 * Set CORS headers
+	 * @param {Object} options 
+	 */
+	cors(options) {
+		options.allowCredentials && this.req.origin && this.headers.set('Access-Control-Allow-Credentials', true);
+		options.allowHeaders && this.headers.set('Access-Control-Allow-Headers', options.allowHeaders);
+		options.allowMethods && this.headers.set('Access-Control-Allow-Methods', options.allowMethods || 'GET');
+		this.headers.set('Access-Control-Allow-Origin', this.req.origin || '*');
+		this.headers.set('Access-Control-Max-Age', options.maxAge ?? 2592e3)
+	}
 
 	defer() {
 		if (!this.deferred) {
@@ -105,7 +116,7 @@ export default class ServerResponse extends EventEmitter {
 
 	async sendFile(path, pipeline = this.server.pipeline) {
 		// if (domainify.test(path)) path = domainify.call(this.req, path);
-		let contentType = /* mimeTypes.parse(path); // */ mimeTypes[extname(path).toLowerCase()];
+		let contentType = /* this.server.allowedMimeTypes.parse(path); // */ this.server.allowedMimeTypes[extname(path).toLowerCase()];
 		if (!contentType) return this.reject(415, `Sorry, file extension ${extname(path)} is not currently supported.`);
 		if (contentType.startsWith('image') && !existsSync(path)) {
 			path = path.replace(extname(path), '');
@@ -113,7 +124,7 @@ export default class ServerResponse extends EventEmitter {
 			if (existsSync(dir)) {
 				const files = await readdir(dir).then(files =>
 					files.filter(basename =>
-						mimeTypes[extname(basename)]?.startsWith('image/')
+						this.server.allowedMimeTypes[extname(basename)]?.startsWith('image/')
 					)
 				);
 				path = dir + '/' + files.find(file => basename(file, extname(file)) === basename(path));
@@ -137,7 +148,10 @@ export default class ServerResponse extends EventEmitter {
 
 		// this.statusCode = 200;
 		// this.setHeader('Content-Type', contentType);
-		this.writeHead(200, { 'content-type': contentType });
+		this.writeHead(200, {
+			// 'content-disposition': `inline; filename="${encodeURIComponent(basename(path))}"`,
+			'content-type': contentType
+		});
 
 		let fileStream = createReadStream(path);
 		if (pipeline) {
@@ -152,17 +166,17 @@ export default class ServerResponse extends EventEmitter {
 				this.statusCode = 500;
 				this.end('Error reading the file');
 			} else {
-				this.destroy(err)
+				this.stream.destroy(err)
 			}
 		});
 
 		this.on('close', () => fileStream.destroy())
 	}
 
-	sendStatus(status, data = null) {
-		let contentType = "text/plain";
-		if (typeof data == 'object') {
-			contentType = "application/json";
+	sendStatus(status, data) {
+		let contentType = 'text/plain';
+		if (typeof data == 'object' && data !== null) {
+			contentType = 'application/json';
 			data = JSON.stringify(data);
 		}
 
@@ -176,6 +190,10 @@ export default class ServerResponse extends EventEmitter {
 		if (typeof status == 'object') headers = status;
 		else if (typeof status == 'number') headers = { ':status': status, ...headers };
 		for (const [key, value] of this.headers.entries()) headers[key] = value;
+
+		const cookies = this.headers.getSetCookie();
+		if (cookies?.length) headers['set-cookie'] = cookies;
+
 		this.stream.respond(headers);
 		for (const key in headers) key.startsWith(':') || this.headers.set(key, headers[key]);
 		Object.freeze(this.headers);

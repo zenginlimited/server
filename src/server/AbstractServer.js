@@ -1,15 +1,15 @@
 import EventEmitter from "events";
 import { realpath } from "fs/promises";
 import { createServer } from "http";
-import { matchesGlob, resolve, sep } from "path";
+import { /* matchesGlob, */ resolve, sep } from "path";
 import mimeTypes from "../utils/mimeTypes.js";
 import Pipeline from "./Pipeline.js";
 
 export default class AbstractServer extends EventEmitter {
 	static Pipeline = Pipeline;
 
-	#protected = new Map();
-	#routes = new Map();
+	#protected = new Map;
+	#routes = new Map;
 
 	allowedMimeTypes = Object.assign({}, mimeTypes);
 	pipeline = new Pipeline;
@@ -26,7 +26,7 @@ export default class AbstractServer extends EventEmitter {
 		super();
 		Object.defineProperties(this, {
 			_conditions: {value: []},
-			listen: {value: function listen() {
+			bind: {value: function bind() {
 				this._server.listen(...arguments);
 				const callback = args.at(-1) || options;
 				if (typeof callback == 'function') callback();
@@ -51,51 +51,62 @@ export default class AbstractServer extends EventEmitter {
 		})
 	}
 
+	#glob(path) {
+		if (path.includes('?')) path = path.replace(/\?$/g, '.');
+		if (path.includes('*')) {
+			path = path.replace(/(?<!\*)(\*)(?!\*)/g, '[^/]$1');
+			if (path.includes('**')) path = path.replace(/(\*){2}/g, '.$1');
+		}
+		if (path.includes('[!')) path = path.replace(/(?<=\[)(\!)(?=.+\])/g, '^');
+		// match :id wildcard options
+		if (path.includes('/:')) path = path.replace(/:[^\/]+/g, '[^/]+');
+		return path
+	}
+
 	#isPathInsideRoot(path) {
 		const rootPath = this.root.replace(/^[/\\]+/, '');
 		return path.slice(1) === rootPath || path.slice(1).startsWith(rootPath + sep);
 	}
 
-	#matchesGlob(path, glob) {
-		if (glob.includes('?'))
-			glob = glob.replace(/\?$/g, '.');
-
-		if (glob.includes('*')) {
-			glob = glob.replace(/(?<!\*)(\*)(?!\*)/g, '[^/]$1');
-			if (glob.includes('**'))
-				glob = glob.replace(/(\*){2}/g, '.$1');
-		}
-
-		if (glob.includes('[!'))
-			glob = glob.replace(/(?<=\[)(\!)(?=.+\])/g, '^');
-
-		// match :id wildcard options
-		if (glob.includes('/:'))
-			glob = glob.replace(/:[^\/]+/g, '[^/]+');
-
-		const globRegex = new RegExp('^' + glob + '$');
-		return globRegex.test(path)
-	}
-
 	#saveRoute(method, path, callback, exceptions) {
-		if (typeof path != "string") {
+		if (typeof path != 'string' && !(path instanceof RegExp)) {
 			if (!Array.isArray(path)) throw new TypeError("Path must be of type: string");
 			for (const p of path) this.#saveRoute(method, p, callback, exceptions);
 			return;
 		}
-		if (typeof callback != "function") throw new TypeError("Callback must be of type: function");
-		if (!this.#routes.has(method))
-			this.#routes.set(method, new Map());
-
+		if (typeof callback != 'function') throw new TypeError("Callback must be of type: function");
+		if (!this.#routes.has(method)) this.#routes.set(method, new Map);
 		if (typeof exceptions == 'object' && exceptions !== null) {
 			Object.defineProperty(callback, 'exceptions', {
-				value: Object.values(exceptions),
+				value: Object.values(exceptions).map(path => {
+					const glob = this.#glob(path);
+					return glob !== path ? new RegExp(`^${glob}$`) : path
+				}),
 				writable: true
 			});
 		}
 
-		Object.defineProperty(callback, 'glob', { value: path, writable: true });
-		Object.defineProperty(callback, 'isDynamic', { value: /\/:.+/.test(path), writable: true });
+		if (typeof path == 'string') {
+			if (path.includes('/:')) {
+				const params = [];
+				let glob = path;
+				if (glob.includes('.')) glob = glob.replace('.', '\\.');
+				const partial = glob.replace(/:([^\/]+)/g, (_, param) => {
+					params.push(param);
+					return '([^/]+)'
+				});
+				const regex = new RegExp(`^${partial}$`);
+				Object.defineProperties(callback, {
+					params: { value: Object.freeze(params) },
+					regex: { value: regex }
+				});
+				path = regex;
+			} else {
+				const glob = this.#glob(path);
+				if (glob !== path) path = new RegExp(`^${glob}$`);
+			}
+		}
+
 		this._route(method).set(path, callback)
 	}
 
@@ -120,29 +131,28 @@ export default class AbstractServer extends EventEmitter {
 	}
 
 	_route(method, path) {
-		const route = this.#routes.get(method) || new Map();
+		const route = this.#routes.get(method);
+		if (!route) return null;
 		if (!path) return route;
 		let match = route.get(path);
 		if (!match) {
-			// match :id wildcard options
-			const globs = Array.from(route.keys()).filter(r => r.includes('*') || /:\w+/.test(r)).sort((a, b) => b.length - a.length) // Array.from(route.keys()).filter(rout => rout.includes('*')).sort((a, b) => b.length - a.length)
-				, glob = globs.find(glob => this.#matchesGlob(path, glob) /* Match everything, and I mean everything */ /* matchesGlob(path, rout) */);
+			const globs = Array.from(route.keys()).filter(route => route instanceof RegExp).sort((a, b) => b.source.length - a.source.length)
+				, glob = globs.find(glob => glob.test(path) /* Match everything, and I mean everything */ /* matchesGlob(path, rout) */);
 			if (glob) {
 				const globMatch = route.get(glob)
-					, matchesException = globMatch.exceptions && globMatch.exceptions.find(glob => this.#matchesGlob(path, glob));
-				if (!matchesException) {
-					match = route.get(glob);
-				}
+					, matchesException = globMatch.exceptions?.find(glob => typeof glob == 'string' ? glob === path : glob.test(path));
+				if (!matchesException) match = route.get(glob);
 			}
 		}
 
-		return match || route.get("*")
+		return match || route.get('*')
 	}
 
 	/**
 	 * 
 	 * @param {Function} callback
 	 */
+	// before() {
 	addCondition(callback) {
 		if (typeof callback != 'function') throw new TypeError("Callback must be of type: function");
 		if (this._conditions.includes(callback) !== -1) throw new Error("This condition has already been added!");
@@ -203,6 +213,15 @@ export default class AbstractServer extends EventEmitter {
 	 */
 	post(path, callback) {
 		return this.#saveRoute('POST', ...arguments)
+	}
+
+	/**
+	 * 
+	 * @param {string} path
+	 * @param {Function} callback
+	 */
+	pre(path, callback) {
+		return this.#saveRoute('PRE', ...arguments)
 	}
 
 	/**

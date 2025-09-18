@@ -25,11 +25,14 @@ declare class AbstractServer extends EventEmitter {
 
 	addCondition(callback: (req: IncomingMessage, res: ServerResponse) => boolean): void
 	auth(path: string | string[], callback: (token: string) => boolean | Promise<boolean>): void
+	bind(port?: number, hostname?: string, listeningListener?: Function): void
+	// bind(options: BindOptions, listeningListener?: Function): void
 	delete(path: string | string[], callback: (req: IncomingMessage, res: ServerResponse) => void): void
 	get(path: string | string[], callback: (req: IncomingMessage, res: ServerResponse) => void): void
 	head(path: string | string[], callback: (req: IncomingMessage, res: ServerResponse) => void): void
 	patch(path: string | string[], callback: (req: IncomingMessage, res: ServerResponse) => void): void
 	post(path: string | string[], callback: (req: IncomingMessage, res: ServerResponse) => void): void
+	pre(path: string | string[], callback: (req: IncomingMessage, res: ServerResponse) => void): void
 	protect(path: string | string[], callback: (token: string) => void): void
 	protect(path: string | string[], config: object, callback: (token: string) => boolean | Promise<boolean>): void
 	put(path: string | string[], callback: (req: IncomingMessage, res: ServerResponse) => void): void
@@ -41,11 +44,14 @@ declare class Http2IncomingMessage {
 	// body: Buffer?
 	cookies: Map<string, boolean | string>
 	headers: Object // Headers
-	method: RequestMethod
 	ip: string
 	readonly ipv4: Uint8Array | null
-	params: URLSearchParams
+	readonly isSameOrigin: boolean
+	method: RequestMethod
+	origin: URL | null
+	params: Object<string, string>
 	path: string
+	query: URLSearchParams
 	scheme: string
 	readonly server: Http2Server
 	readonly stream: Http2Stream
@@ -63,7 +69,7 @@ declare class Http2ServerResponse {
 	status: number | null
 	readonly stream: Http2Stream
 
-	// cookie(key: string, value: string, options?: object): void
+	cookie(key: string, value: string, options?: CookieOptions): void
 	// cors(): void
 	defer(): boolean
 	downloadFile(path: string): void
@@ -89,11 +95,13 @@ declare class Http2Server extends AbstractServer {
 	constructor(options: WebServerOptions)
 
 	addCondition(callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => boolean): void
+	// before(callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => boolean): void
 	delete(path: string | string[], callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => void): void
 	get(path: string | string[], callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => void): void
 	head(path: string | string[], callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => void): void
 	patch(path: string | string[], callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => void): void
 	post(path: string | string[], callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => void): void
+	pre(path: string | string[], callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => void): void
 	put(path: string | string[], callback: (req: Http2IncomingMessage, res: Http2ServerResponse) => void): void
 }
 //#endregion
@@ -105,7 +113,30 @@ interface AbstractServerOptions extends ServerOptions {
 	redirectHTTP: boolean
 }
 
+interface CookieOptions {
+	domain: string,
+	expires: Date | string,
+	httpOnly: boolean,
+	maxAge: number,
+	partitioned: boolean,
+	path: string,
+	priority: CookiePriority,
+	sameSite: CookieCrossSiteOptions,
+	secure: boolean
+}
+
 interface WebServerOptions extends AbstractServerOptions {
+	blockCrossFrames: boolean,
+	cookies: {
+		partitioned: boolean
+	},
+	cors: {
+		allowCredentials: boolean,
+		allowHeaders: string[],
+		allowMethods: RequestMethod[],
+		allowOrigin: string,
+		maxAge: number
+	},
 	// http?: ServerOptions,
 	// https?: SecureServerOptions,
 	ssl: {
@@ -117,11 +148,24 @@ interface WebServerOptions extends AbstractServerOptions {
 //#endregion
 
 //#region Enumerations
+declare enum CookieCrossSiteOptions {
+	Lax = 'Lax',
+	None = 'None',
+	Strict = 'Strict'
+}
+
+declare enum CookiePriority {
+	High = 'High',
+	Low = 'Low',
+	Medium = 'Medium'
+}
+
 declare enum RequestMethod {
 	Delete = 'DELETE',
 	Get = 'GET',
 	Head = 'HEAD',
 	Options = 'OPTIONS',
+	Patch = 'PATCH',
 	Post = 'POST',
 	Put = 'PUT'
 }
@@ -129,6 +173,6 @@ declare enum RequestMethod {
 
 //#region Exports
 export { Pipeline, Http2Server, Http2IncomingMessage as IncomingMessage, Http2ServerResponse as ServerResponse, WebServer }
-export type { AbstractServerOptions, WebServerOptions }
-export { RequestMethod }
+export type { AbstractServerOptions, CookieOptions, WebServerOptions }
+export { CookieCrossSiteOptions, RequestMethod }
 export default Http2Server

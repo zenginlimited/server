@@ -168,43 +168,19 @@ export default class WebServer extends AbstractServer {
 			}
 
 			Object.defineProperty(req, 'filePath', { value: await jailPath(subdomain ? (options.host ? subdomain + '.' + options.host : req.headers.host) : this.root, req.url, extname(req.url) ? '' : 'index.html'), writable: true });
-			if (req.params.has('download')) return res.downloadFile(req.filePath);
+			if (req.query.has('download')) return res.downloadFile(req.filePath);
 			Object.defineProperties(req, {
 				actualPath: { value: req.filePath, writable: true },
 				dirPath: { value: req.filePath.replace(basename(req.filePath), ''), writable: true }
 			});
 
-			const saveData = 'on' === req.headers['save-data'];
-			let route = this._route(req.method, (subdomain !== null ? `${subdomain}.` : '') + req.url);
+			// const saveData = 'on' === req.headers['save-data'];
+			const route = this._route(req.method, (subdomain !== null ? `${subdomain}.` : '') + req.url);
 			if (typeof route == 'function') {
-				// add :id wildcard options
-				if (route.isDynamic) {
-					Object.defineProperty(req, 'routeMap', {
-						value: new Map(),
-						writable: true
-					});
-
-					try {
-						let identifiers = []
-						, regex = route.glob;
-						if (regex.includes('.')) {
-							regex = regex.replace('.', '\\.');
-						}
-
-						regex = regex.replace(/:([^\/]+)/g, (_, identifier) => {
-							identifiers.push(identifier);
-							return '([^/]+)'
-						});
-						regex = new RegExp('^' + regex + '$');
-						const [_, ...values] = regex.exec((subdomain !== null ? `${subdomain}.` : '') + req.url);
-						if (values && values.length > 0) {
-							for (const value in values) {
-								req.routeMap.set(identifiers[value], values[value]);
-							}
-						}
-					} catch (err) {
-						console.error('Failed to set identifiers:', err);
-					}
+				if (route.params) {
+					Object.defineProperty(req, 'params', { value: {}, writable: false });
+					const [_, ...params] = route.regex.exec((subdomain !== null ? `${subdomain}.` : '') + req.url);
+					if (params) for (const p in params) req.params[route.params[p]] = params[p];
 				}
 
 				// Request timeout
@@ -217,9 +193,11 @@ export default class WebServer extends AbstractServer {
 					let result = route(req, res);
 					if (result instanceof Promise) result = await result;
 					if (result !== false || res.finished) return;
+					if (/* options.resolveReturnValue && */ result) res.resolve(result);
 				} catch (err) {
-					console.error('Unhandled error in request processing:', err);
-					return !res.finished && res.reject(500, 'Internal Server Error');
+					res.finished || res.reject(500, 'Internal Server Error');
+					if (this.listenerCount('error') === 0) throw err;
+					return this.emit('error', err);
 				}
 			}
 
@@ -277,7 +255,7 @@ export default class WebServer extends AbstractServer {
 				return isSocial || isOther
 			}},
 			isIPInternal: {value: function isIPInternal() { return isLocal(this.ip) }},
-			params: { value: new URLSearchParams(search) }
+			query: { value: new URLSearchParams(search) }
 		})
 	}
 
