@@ -1,7 +1,7 @@
 {
 	"author": "Ayoob <ayoob@zengin.ca>",
 	"name": "@zenginlimited/server",
-	"version": "0.0.2",
+	"version": "0.0.3-dev.1758227974",
 	"description": "A web-server tailored to Zengin services.",
 	"keywords": ["http", "https", "web", "webserver"],
 	"bugs": { "url": "https://github.com/zenginlimited/server/issues" },
